@@ -867,9 +867,40 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR6_K);
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kq0 = 2*txi - txi % (QI6_K/2) + 0;
+    const int kq1 = 2*txi - txi % (QI6_K/2) + QI6_K/2;
+    const int qh_idx = (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4);
+    const int qh_shift = (txi & 0x08) >> 2;
+    constexpr int step_i = nrows * nwarps;
 
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+#if defined(RDNA4) && (defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
+    if constexpr (!fallback) {
+        const int i_lane = (nrows == 1) ? threadIdx.y : (threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        int * row = x_qs + i_lane * sram_stride;
+        const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i_lane * stride;
+MMQ_UNROLL
+        for (int i0 = 0; i0 < I; i0 += step_i) {
+            const int ql = get_int_b4(bxi->ql, txi);
+            const int qh = get_int_b4(bxi->qh, qh_idx);
+            const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+            const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+            const int qh0 = ((qh >> qh_shift) << 4) & 0x30303030;
+            const int qh1 =  (qh >> qh_shift)       & 0x30303030;
+#if MMQ_Q6_PACKED_P04
+            row[kq0] = ql0 | qh0;
+            row[kq1] = ql1 | qh1;
+#else
+            row[kq0] = __vsubss4(ql0 | qh0, 0x20202020);
+            row[kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+#endif
+            row += step_i * sram_stride;
+            bxi += step_i * stride;
+        }
+    } else
+#endif // RDNA4 + MMA
+    {
+MMQ_UNROLL
+    for (int i0 = 0; i0 < I; i0 += step_i) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
         if (fallback) {
@@ -878,27 +909,36 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride;
 
+#if defined(RDNA4)
+        const int ql = get_int_b4(bxi->ql, txi);
+        const int qh = get_int_b4(bxi->qh, qh_idx);
+#else
         const int ql = get_int_b2(bxi->ql, txi);
+        const int qh = get_int_b2(bxi->qh, qh_idx);
+#endif // defined(RDNA4)
         const int ql0 = (ql >> 0) & 0x0F0F0F0F;
         const int ql1 = (ql >> 4) & 0x0F0F0F0F;
 
-        const int qh = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
-        const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
-        const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
-
-        const int kq0 = 2*txi - txi % (QI6_K/2) + 0;
-        const int kq1 = 2*txi - txi % (QI6_K/2) + QI6_K/2;
+        const int qh0 = ((qh >> qh_shift) << 4) & 0x30303030;
+        const int qh1 =  (qh >> qh_shift)       & 0x30303030;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
-        x_qs[i*sram_stride + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+        int * row = x_qs + i * sram_stride;
+#if defined(RDNA4) && MMQ_Q6_PACKED_P04
+        row[kq0] = ql0 | qh0;
+        row[kq1] = ql1 | qh1;
+#else
+        row[kq0] = __vsubss4(ql0 | qh0, 0x20202020);
+        row[kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+#endif
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
+    }
 
-#pragma unroll
+MMQ_UNROLL
     for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
         int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
 
@@ -916,7 +956,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 
     constexpr int rows_per_warp = warp_size / 4;
-#pragma unroll
+MMQ_UNROLL
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
 
@@ -927,7 +967,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride + (threadIdx.x % (MMQ_TILE_NE_K/8)) / 4;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(RDNA4)
+        x_sc[i*sram_stride + threadIdx.x%4] = get_int_b4(bxi->scales, threadIdx.x % (MMQ_TILE_NE_K/8));
+#else
         x_sc[i*sram_stride + threadIdx.x%4] = get_int_b2(bxi->scales, threadIdx.x % (MMQ_TILE_NE_K/8));
+#endif // defined(RDNA4)
 #else
         x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + threadIdx.x%(MMQ_TILE_NE_K/8)] = get_int_b2(bxi->scales, threadIdx.x%(QI6_K/8));
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)

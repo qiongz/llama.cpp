@@ -10,6 +10,18 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// RDNA4: unroll dequant/load-tiles loops by 8 (vs stock default).
+#if defined(RDNA4)
+#define MMQ_UNROLL _Pragma("unroll 8")
+#else
+#define MMQ_UNROLL _Pragma("unroll")
+#endif
+
+// RDNA4 Q6_K: store packed 6-bit-in-byte values in LDS; expand after ldmatrix.
+#ifndef MMQ_Q6_PACKED_P04
+#define MMQ_Q6_PACKED_P04 1
+#endif
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -846,38 +858,84 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#if defined(RDNA4)
+        // Prefetch y1 into registers before load_tiles; exclude scale-heavy K-quants
+        // (Q4_K/Q3_K/Q2_K) where y1_reg[] register pressure outweighs the HBM savings.
+        if constexpr (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q3_K && type != GGML_TYPE_Q2_K) {
+            constexpr int n_y_ld = (J * MMQ_TILE_Y_K + nwarps * warp_size - 1) / (nwarps * warp_size);
+            int y1_reg[n_y_ld];
+            {
+                const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                for (int i = 0; i < n_y_ld; ++i) {
+                    const int l = i * nwarps * warp_size + threadIdx.y * warp_size + threadIdx.x;
+                    y1_reg[i] = by1[l];
+                }
             }
-        }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, 0);
-
-        __syncthreads();
-
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
             }
+            __syncthreads();
+            vec_dot(tile_x, tile_y, sum, 0);
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < n_y_ld; ++i) {
+                const int l = i * nwarps * warp_size + threadIdx.y * warp_size + threadIdx.x;
+                tile_y[l] = y1_reg[i];
+            }
+            __syncthreads();
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            __syncthreads();
+            if constexpr (type == GGML_TYPE_Q6_K) {
+                const int kb0_next = kb0 + blocks_per_iter;
+                if (kb0_next < kb0_stop) {
+                    const int tid = threadIdx.y * warp_size + threadIdx.x;
+                    const block_q6_K * bxi_n = (const block_q6_K *) x + offset_x + kb0_next + (tid % I) * stride_row_x;
+                    asm volatile("" :: "v"(bxi_n));
+                }
+            }
+        } else
+#endif // defined(RDNA4)
+        {
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
         }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
-
-        __syncthreads();
     }
 
     if (fixup) {

@@ -1038,13 +1038,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+    auto k01_body = [&](const int k01) {
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+#if defined(RDNA4) && MMQ_Q6_PACKED_P04
+#pragma unroll
+            for (int l = 0; l < tile_A::ne; ++l) {
+                A[n].x[l] = __vsubss4(A[n].x[l], 0x20202020);
+            }
+#endif
         }
 
 #pragma unroll
@@ -1055,6 +1061,42 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const int j = j0 + tile_C::get_j(0);
             const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
 
+#if defined(RDNA4)
+            // Small J (<=16, decode): stock mul+add for bit-exact; large J (prefill): fmaf.
+            if constexpr (J <= 16) {
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                        const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    }
+                }
+            } else {
+                float sd_all[ntx][tile_C::ne];
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                        const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
+                        sd_all[n][l] = (float)sc[k01/4] * x_df[i*sram_stride];
+                    }
+                }
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] = fmaf(C.x[l] * sd_all[n][l], dB, sum[(j0/tile_C::J + n)*tile_C::ne + l]);
+                    }
+                }
+            }
+#else
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
@@ -1067,8 +1109,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
                 }
             }
+#endif // defined(RDNA4)
         }
+    };
+#if defined(RDNA4)
+    if constexpr (J <= 16) {
+#pragma unroll 2
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) k01_body(k01);
+    } else {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) k01_body(k01);
     }
+#else
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+        k01_body(k01);
+    }
+#endif // defined(RDNA4)
 #elif defined(TURING_MMA_AVAILABLE)
 
     typedef tile<16, 4, int> tile_A;
